@@ -3,13 +3,17 @@
 #include <QDirIterator>
 #include <QDebug>
 #include <QTextStream>
+#include <QTimer>
+#include <QScriptValue>
+#include <QScriptEngine>
+
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent)
 {
     setupUi(this);
-
+    charCount = 0;
     //set combo box from tables available in language db
-    QDir langDir("lang");
+    QDir langDir("phonetics");
     langDir.setFilter(QDir::Files);
     QStringList languages = langDir.entryList();
     langSelect->addItems(languages);
@@ -22,9 +26,14 @@ MainWindow::MainWindow(QWidget *parent) :
         langSelect->setCurrentIndex(index);
         lastLang.close();
     }
-    nativeText->selectAll();
-    nativeText->setFocus();
-
+    originalText->selectAll();
+    originalText->setFocus();
+    checkCharCount.setInterval(1000);
+    QObject::connect(&checkCharCount, SIGNAL(timeout()), this, SLOT(hasTextChanged()));
+    QObject::connect(&connection, SIGNAL(finished(QNetworkReply*)),
+                     this, SLOT(translateReady(QNetworkReply*)));
+    fromEnglish = false;
+    updateLanguageStatus();
 
 }
 
@@ -52,16 +61,19 @@ void MainWindow::changeEvent(QEvent *e)
 void MainWindow::on_langSelect_currentIndexChanged(QString lang)
 {
     //build mapping
-    QFile langFile(lang.prepend("lang/"));
+    QFile langFile(lang.prepend("phonetics/"));
     if(!langFile.open(QFile::ReadOnly))
     {
-        error->setText(langFile.errorString());
+        statusMsg->setText(langFile.errorString());
     }
     else
     {
         QTextStream stream(&langFile);
-        error->clear();
+        statusMsg->clear();
         QString line;
+
+        foreignLanguage = stream.readLine().remove(0, 1).trimmed();
+        updateLanguageStatus();
         while(true)
         {
             line = stream.readLine().trimmed();
@@ -75,20 +87,102 @@ void MainWindow::on_langSelect_currentIndexChanged(QString lang)
 
 }
 
-void MainWindow::on_nativeText_textChanged()
+void MainWindow::on_reverseTranslation_clicked()
 {
-    if(nativeText->toPlainText().isEmpty())
+    if(!fromEnglish)
+        fromEnglish = true;
+    else
+        fromEnglish = false;
+    updateLanguageStatus();
+}
+
+void MainWindow::updateLanguageStatus()
+{
+    QString order;
+    if(fromEnglish)
+        order = QString("English to "+ langSelect->currentText());
+    else
+        order = QString(langSelect->currentText() +  " to English");
+    translatingStatus->setText(order);
+}
+
+void MainWindow::on_originalText_textChanged()
+{
+    statusMsg->clear();
+    if(!checkCharCount.isActive())
+        checkCharCount.start();
+    //do a phonetic replacement if this is not english
+    if(!fromEnglish)
     {
-        latinText->clear();
-        return;
+        latinifyText(originalText->toPlainText());
     }
-    QString text = nativeText->toPlainText();
-    QString latin;
-    for(int i=0; i<text.length(); i++)
+}
+
+void MainWindow::on_translation_textChanged()
+{
+    //if current language is not english and do a phonetic replacement
+    if(fromEnglish)
     {
-        latin.append(langMap.value(text.at(i), text.at(i)));
+        latinifyText(translation->toPlainText());
+    }
+}
+
+void MainWindow::latinifyText(QString foreignString)
+{
+
+    QString latin;
+    for(int i=0; i<foreignString.length(); i++)
+    {
+        latin.append(langMap.value(foreignString.at(i), foreignString.at(i)));
     }
     latinText->setText(latin);
 
-
 }
+
+bool MainWindow::hasTextChanged()
+{
+    //returns true if the character count has not changed in the last 2 seconds
+        if(originalText->toPlainText().isEmpty())
+            return false;
+
+    if(oldCharCount == charCount)
+    {
+        checkCharCount.stop();
+        requestTranslation();
+        return true;
+    }
+    oldCharCount = charCount;
+    return false;
+}
+
+void MainWindow::requestTranslation()
+{
+    QByteArray langpair;
+    if(fromEnglish)
+        langpair = "en|" + foreignLanguage.toUtf8();
+    else
+        langpair = foreignLanguage.toUtf8() + "|en";
+
+    if(originalText->toPlainText().isEmpty())
+            return;
+
+    translation->setText(translation->toPlainText() + "...");
+    QUrl url(QString("http://ajax.googleapis.com/ajax/services/language/translate"));
+    url.addQueryItem("v", "1.0");
+    url.addQueryItem("q", originalText->toPlainText());
+    url.addQueryItem("langpair", langpair);
+    request.setUrl(url);
+    connection.get(request);
+}
+
+
+void MainWindow::translateReady(QNetworkReply* reply)
+{
+    QScriptValue sc;
+    QScriptEngine engine;
+    sc = engine.evaluate(QString(reply->readAll()));
+    qDebug() << sc.property("responseStatus").toString();
+    QString trans = sc.property("responseData").toObject().property("translatedText").toString();
+    translation->setText(trans);
+}
+
